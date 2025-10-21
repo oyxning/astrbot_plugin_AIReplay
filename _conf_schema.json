@@ -1,0 +1,90 @@
+{
+  "enable": {
+    "description": "启用/停用 AIReplay",
+    "type": "bool",
+    "default": true
+  },
+  "timezone": {
+    "description": "IANA 时区（留空使用系统时区），例如 Asia/Shanghai、America/Los_Angeles",
+    "type": "string",
+    "default": ""
+  },
+  "after_last_msg_minutes": {
+    "description": "最后一条消息后多久主动触发（分钟）。0 表示关闭该触发器",
+    "type": "int",
+    "default": 0
+  },
+  "daily": {
+    "description": "每天两档定时触发（相互不冲突；若相同自动错峰1分钟）",
+    "type": "object",
+    "items": {
+      "time1": {
+        "description": "HH:MM（24h）",
+        "type": "string",
+        "default": ""
+      },
+      "time2": {
+        "description": "HH:MM（24h）",
+        "type": "string",
+        "default": ""
+      }
+    }
+  },
+  "quiet_hours": {
+    "description": "免打扰时段（不触发主动回复），格式 HH:MM-HH:MM，可跨天",
+    "type": "string",
+    "default": ""
+  },
+  "history_depth": {
+    "description": "拼接最近聊天记录条数（从当前对话历史中提取）",
+    "type": "int",
+    "default": 8
+  },
+  "persona_override": {
+    "description": "自定义人格 System Prompt（留空使用当前对话人格）",
+    "type": "text",
+    "default": ""
+  },
+  "custom_prompt": {
+    "description": "自定义提示词（可用占位符：{now}、{last_user}、{last_ai}、{umo}）。为空则让模型自然续聊",
+    "type": "text",
+    "default": ""
+  },
+  "append_time_field": {
+    "description": "在消息前追加时间字段（例如“[2025-10-21 09:30] ”）",
+    "type": "bool",
+    "default": false
+  },
+  "time_format": {
+    "description": "时间字段格式（Python strftime）",
+    "type": "string",
+    "default": "%Y-%m-%d %H:%M"
+  },
+  "subscribe_mode": {
+    "description": "订阅方式：auto=有互动即自动纳入；manual=需 /aireplay watch",
+    "type": "string",
+    "options": [
+      "auto",
+      "manual"
+    ],
+    "default": "manual"
+  },
+  "_special": {
+    "description": "可视化选择默认聊天模型/人格（可选）",
+    "type": "object",
+    "items": {
+      "provider": {
+        "description": "固定使用的聊天 Provider（为空则按当前会话）",
+        "type": "string",
+        "default": "",
+        " _special": "select_provider"
+      },
+      "persona": {
+        "description": "固定的人格（为空则按当前会话）",
+        "type": "string",
+        "default": "",
+        "_special": "select_persona"
+      }
+    }
+  }
+}
