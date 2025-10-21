@@ -1,5 +1,6 @@
 name: AIReplay
 author: LumineStory
-version: 1.0.0
+version: 1.0.2
+description: 主动定时触发 AI 自然切入回复 + 免打扰 + 最近聊天记录 + 人格 + 定时提醒
 desc: 主动定时触发 AI 自然切入回复 + 免打扰 + 最近聊天记录 + 人格 + 定时提醒
 repo: https://github.com/oyxning/astrbot_plugin_AIReplay

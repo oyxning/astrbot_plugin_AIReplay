@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Deque, Tuple
 from collections import defaultdict, deque
 
 import astrbot.api.message_components as Comp
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult, EventMessageType
+from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 from astrbot.api.config import AstrBotConfig
@@ -68,7 +68,7 @@ class Reminder:
     at: str           # "YYYY-MM-DD HH:MM" 或 "HH:MM|daily"
     created_at: float
 
-@register("AIReplay", "LumineStory", "定时/间隔主动续聊 + 人格 + 历史 + 免打扰 + 提醒", "1.0.1", "https://github.com/oyxning/astrbot_plugin_AIReplay")
+@register("AIReplay", "LumineStory", "定时/间隔主动续聊 + 人格 + 历史 + 免打扰 + 提醒", "1.0.2", "https://github.com/oyxning/astrbot_plugin_AIReplay")
 class AIReplay(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -133,7 +133,7 @@ class AIReplay(Star):
         except Exception as e:
             logger.error(f"[AIReplay] save reminders error: {e}")
 
-    @filter.event_message_type(EventMessageType.ALL)
+    @filter.event_message_type(filter.EventMessageType.ALL)
     async def _on_any_message(self, event: AstrMessageEvent):
         umo = event.unified_msg_origin
         st = self._states[umo]
@@ -229,6 +229,7 @@ class AIReplay(Star):
             yield reply(f"🗓️ 已设置 daily2：{m.group(1)}")
             return
 
+		# quiet hours
         m = re.search(r"set\s+quiet\s+(\d{1,2}:\d{2})-(\d{1,2}:\d{2})", lower)
         if m:
             self.cfg["quiet_hours"] = f"{m.group(1)}-{m.group(2)}"
@@ -315,7 +316,6 @@ class AIReplay(Star):
         if not arr:
             return "暂无提醒"
         arr.sort(key=lambda x: x.created_at)
-        # FIXED: remove bad escaping in f-string
         return "提醒列表：\n" + "\n".join(f"{r.id} | {r.at} | {r.content}" for r in arr)
 
     async def _scheduler_loop(self):
