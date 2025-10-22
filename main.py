@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import random
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, time
@@ -243,11 +244,52 @@ class AIReplay(Star):
             yield reply(f"🧵 已设置历史条数：{mp.group(1)}")
             return
 
-        mp2 = re.search(r"set\s+prompt\s+(.+)$", text, flags=re.I | re.S)
-        if mp2:
-            self.cfg["custom_prompt"] = mp2.group(1).strip()
-            self.cfg.save_config()
-            yield reply("✏️ 已更新自定义提示词")
+        # 处理多提示词管理命令
+        if " prompt " in lower:
+            parts = text.split()
+            if len(parts) >= 3 and parts[1].lower() == "prompt":
+                sub = parts[2].lower()
+                if sub == "list":
+                    prompts = self.cfg.get("custom_prompts") or []
+                    if not prompts:
+                        yield reply("📝 暂无自定义提示词")
+                    else:
+                        result = "📝 当前提示词列表：\n"
+                        for i, prompt in enumerate(prompts, 1):
+                            result += f"{i}. {prompt[:50]}{'...' if len(prompt) > 50 else ''}\n"
+                        yield reply(result)
+                    return
+                elif sub == "add" and len(parts) >= 4:
+                    new_prompt = text.split("add", 1)[1].strip()
+                    if new_prompt:
+                        prompts = self.cfg.get("custom_prompts") or []
+                        prompts.append(new_prompt)
+                        self.cfg["custom_prompts"] = prompts
+                        self.cfg.save_config()
+                        yield reply(f"✏️ 已添加提示词（共{len(prompts)}个）")
+                    else:
+                        yield reply("❌ 提示词内容不能为空")
+                    return
+                elif sub == "del" and len(parts) >= 4:
+                    try:
+                        index = int(parts[3]) - 1
+                        prompts = self.cfg.get("custom_prompts") or []
+                        if 0 <= index < len(prompts):
+                            del prompts[index]
+                            self.cfg["custom_prompts"] = prompts
+                            self.cfg.save_config()
+                            yield reply(f"🗑️ 已删除提示词（剩余{len(prompts)}个）")
+                        else:
+                            yield reply("❌ 提示词索引超出范围")
+                    except ValueError:
+                        yield reply("❌ 请输入有效的数字索引")
+                    return
+                elif sub == "clear":
+                    self.cfg["custom_prompts"] = []
+                    self.cfg.save_config()
+                    yield reply("🗑️ 已清空所有提示词")
+                    return
+            yield reply("用法：/aireplay prompt list|add <内容>|del <索引>|clear")
             return
 
         if " remind " in lower or lower.endswith(" remind"):
@@ -304,7 +346,7 @@ class AIReplay(Star):
             "/aireplay set daily2 <HH:MM>\n"
             "/aireplay set quiet <HH:MM-HH:MM>\n"
             "/aireplay set history <N>\n"
-            "/aireplay set prompt <文本>\n"
+            "/aireplay prompt list|add <内容>|del <索引>|clear\n"
             "/aireplay remind add <YYYY-MM-DD HH:MM> <内容>\n"
             "/aireplay remind add <HH:MM> <内容> daily\n"
             "/aireplay remind list | /aireplay remind del <ID>\n"
@@ -441,8 +483,11 @@ class AIReplay(Star):
                 if st:
                     contexts = list(st.history)[-hist_n:]
 
-            templ = (self.cfg.get("custom_prompt") or "").strip()
-            if templ:
+            # 获取自定义提示词列表
+            custom_prompts = self.cfg.get("custom_prompts") or []
+            if custom_prompts and len(custom_prompts) > 0:
+                # 随机选择一个提示词
+                templ = random.choice(custom_prompts).strip()
                 last_user = ""
                 last_ai = ""
                 for m in reversed(contexts):

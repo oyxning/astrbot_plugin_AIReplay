@@ -45,10 +45,13 @@
     "type": "text",
     "default": ""
   },
-  "custom_prompt": {
-    "description": "自定义提示词（可用占位符：{now}、{last_user}、{last_ai}、{umo}）。为空则让模型自然续聊",
-    "type": "text",
-    "default": ""
+  "custom_prompts": {
+    "description": "自定义提示词列表（可用占位符：{now}、{last_user}、{last_ai}、{umo}）。每次触发时随机选择一个。为空则让模型自然续聊",
+    "type": "array",
+    "items": {
+      "type": "text"
+    },
+    "default": []
   },
   "append_time_field": {
     "description": "在消息前追加时间字段（例如“[2025-10-21 09:30] ”）",
