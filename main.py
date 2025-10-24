@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import random
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, time
@@ -16,6 +17,7 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 from astrbot.api import AstrBotConfig  # per docs: from astrbot.api import AstrBotConfig
 
+# 工具函数
 def _ensure_dir(p: str):
     os.makedirs(p, exist_ok=True)
     return p
@@ -53,12 +55,15 @@ def _in_quiet(now: datetime, quiet: str) -> bool:
 def _fmt_now(fmt: str, tz: str | None) -> str:
     return _now_tz(tz).strftime(fmt)
 
+# 数据结构定义
 @dataclass
 class SessionState:
     last_ts: float = 0.0
     history: Deque[Dict] = field(default_factory=lambda: deque(maxlen=32))
     subscribed: bool = False
     last_fired_tag: str = ""
+    last_user_reply_ts: float = 0.0  # 用户最后回复时间戳
+    consecutive_no_reply_count: int = 0  # 连续无回复次数
 
 @dataclass
 class Reminder:
@@ -68,17 +73,18 @@ class Reminder:
     at: str           # "YYYY-MM-DD HH:MM" 或 "HH:MM|daily"
     created_at: float
 
+# 主插件
 @register("AIReplay", "LumineStory", "定时/间隔主动续聊 + 人格 + 历史 + 免打扰 + 提醒", "1.0.3", "https://github.com/oyxning/astrbot_plugin_AIReplay")
 class AIReplay(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.cfg: AstrBotConfig = config
         self._loop_task: Optional[asyncio.Task] = None
-        self._states: Dict[str, SessionState] = defaultdict(SessionState)
+        self._states: Dict[str, SessionState] = {}
         self._reminders: Dict[str, Reminder] = {}
 
         root = os.getcwd()
-        self._data_dir = _ensure_dir(os.path.join(root, "data", "plugins", "astrbot_plugin_aireplay"))
+        self._data_dir = _ensure_dir(os.path.join(root, "data", "plugin_data", "astrbot_plugin_aireplay"))
         self._state_path = os.path.join(self._data_dir, "state.json")
         self._remind_path = os.path.join(self._data_dir, "reminders.json")
         self._load_states()
@@ -87,15 +93,25 @@ class AIReplay(Star):
         self._loop_task = asyncio.create_task(self._scheduler_loop())
         logger.info("[AIReplay] scheduler started.")
 
+    # 数据持久化
     def _load_states(self):
         if os.path.exists(self._state_path):
             try:
                 d = json.load(open(self._state_path, "r", encoding="utf-8"))
                 for umo, st in d.get("states", {}).items():
+                    # 恢复历史记录
+                    history = deque(maxlen=32)
+                    if "history" in st:
+                        for h in st["history"]:
+                            history.append(h)
+                    
                     s = SessionState(
                         last_ts=st.get("last_ts", 0.0),
+                        history=history,
                         subscribed=st.get("subscribed", False),
                         last_fired_tag=st.get("last_fired_tag", ""),
+                        last_user_reply_ts=st.get("last_user_reply_ts", 0.0),
+                        consecutive_no_reply_count=st.get("consecutive_no_reply_count", 0),
                     )
                     self._states[umo] = s
             except Exception as e:
@@ -107,8 +123,11 @@ class AIReplay(Star):
                 "states": {
                     k: {
                         "last_ts": v.last_ts,
+                        "history": list(v.history),  # 保存历史记录
                         "subscribed": v.subscribed,
-                        "last_fired_tag": v.last_fired_tag
+                        "last_fired_tag": v.last_fired_tag,
+                        "last_user_reply_ts": v.last_user_reply_ts,
+                        "consecutive_no_reply_count": v.consecutive_no_reply_count
                     } for k, v in self._states.items()
                 }
             }
@@ -133,11 +152,17 @@ class AIReplay(Star):
         except Exception as e:
             logger.error(f"[AIReplay] save reminders error: {e}")
 
+    # 消息处理
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def _on_any_message(self, event: AstrMessageEvent):
         umo = event.unified_msg_origin
+        if umo not in self._states:
+            self._states[umo] = SessionState()
         st = self._states[umo]
-        st.last_ts = _now_tz(self.cfg.get("timezone") or None).timestamp()
+        now_ts = _now_tz(self.cfg.get("timezone") or None).timestamp()
+        st.last_ts = now_ts
+        st.last_user_reply_ts = now_ts  # 记录用户最后回复时间
+        st.consecutive_no_reply_count = 0  # 重置无回复计数
 
         if (self.cfg.get("subscribe_mode") or "manual") == "auto":
             st.subscribed = True
@@ -152,8 +177,9 @@ class AIReplay(Star):
 
         self._save_states()
 
+    # QQ命令处理
     @filter.command("aireplay")
-    async def _cmd_aireplay(self, event: AstrMessageEvent, *args: str):
+    async def _cmd_aireplay(self, event: AstrMessageEvent):
         text = (event.message_str or "").strip()
         lower = text.lower()
 
@@ -162,6 +188,23 @@ class AIReplay(Star):
 
         if "help" in lower or text.strip() == "/aireplay":
             yield reply(self._help_text())
+            return
+
+        if " debug" in lower:
+            # 调试信息
+            debug_info = []
+            debug_info.append(f"插件启用状态: {self.cfg.get('enable', True)}")
+            debug_info.append(f"订阅模式: {self.cfg.get('subscribe_mode', 'manual')}")
+            debug_info.append(f"订阅用户数: {len([s for s in self._states.values() if s.subscribed])}")
+            debug_info.append(f"当前用户: {event.unified_msg_origin}")
+            umo = event.unified_msg_origin
+            if umo not in self._states:
+                self._states[umo] = SessionState()
+            debug_info.append(f"用户订阅状态: {self._states[umo].subscribed}")
+            debug_info.append(f"间隔触发设置: {self.cfg.get('after_last_msg_minutes', 0)}分钟")
+            debug_info.append(f"免打扰时间: {self.cfg.get('quiet_hours', '')}")
+            debug_info.append(f"最大无回复天数: {self.cfg.get('max_no_reply_days', 0)}")
+            yield reply("🔍 调试信息:\n" + "\n".join(debug_info))
             return
 
         if " on" in lower:
@@ -177,6 +220,8 @@ class AIReplay(Star):
 
         if " watch" in lower:
             umo = event.unified_msg_origin
+            if umo not in self._states:
+                self._states[umo] = SessionState()
             self._states[umo].subscribed = True
             self._save_states()
             yield reply(f"📌 已订阅当前会话：{umo}")
@@ -184,6 +229,8 @@ class AIReplay(Star):
 
         if " unwatch" in lower:
             umo = event.unified_msg_origin
+            if umo not in self._states:
+                self._states[umo] = SessionState()
             self._states[umo].subscribed = False
             self._save_states()
             yield reply(f"📭 已退订当前会话：{umo}")
@@ -243,11 +290,52 @@ class AIReplay(Star):
             yield reply(f"🧵 已设置历史条数：{mp.group(1)}")
             return
 
-        mp2 = re.search(r"set\s+prompt\s+(.+)$", text, flags=re.I | re.S)
-        if mp2:
-            self.cfg["custom_prompt"] = mp2.group(1).strip()
-            self.cfg.save_config()
-            yield reply("✏️ 已更新自定义提示词")
+        # 处理多提示词管理命令
+        if " prompt " in lower:
+            parts = text.split()
+            if len(parts) >= 3 and parts[1].lower() == "prompt":
+                sub = parts[2].lower()
+                if sub == "list":
+                    prompts = self.cfg.get("custom_prompts") or []
+                    if not prompts:
+                        yield reply("📝 暂无自定义提示词")
+                    else:
+                        result = "📝 当前提示词列表：\n"
+                        for i, prompt in enumerate(prompts, 1):
+                            result += f"{i}. {prompt[:50]}{'...' if len(prompt) > 50 else ''}\n"
+                        yield reply(result)
+                    return
+                elif sub == "add" and len(parts) >= 4:
+                    new_prompt = text.split("add", 1)[1].strip()
+                    if new_prompt:
+                        prompts = self.cfg.get("custom_prompts") or []
+                        prompts.append(new_prompt)
+                        self.cfg["custom_prompts"] = prompts
+                        self.cfg.save_config()
+                        yield reply(f"✏️ 已添加提示词（共{len(prompts)}个）")
+                    else:
+                        yield reply("❌ 提示词内容不能为空")
+                    return
+                elif sub == "del" and len(parts) >= 4:
+                    try:
+                        index = int(parts[3]) - 1
+                        prompts = self.cfg.get("custom_prompts") or []
+                        if 0 <= index < len(prompts):
+                            del prompts[index]
+                            self.cfg["custom_prompts"] = prompts
+                            self.cfg.save_config()
+                            yield reply(f"🗑️ 已删除提示词（剩余{len(prompts)}个）")
+                        else:
+                            yield reply("❌ 提示词索引超出范围")
+                    except ValueError:
+                        yield reply("❌ 请输入有效的数字索引")
+                    return
+                elif sub == "clear":
+                    self.cfg["custom_prompts"] = []
+                    self.cfg.save_config()
+                    yield reply("🗑️ 已清空所有提示词")
+                    return
+            yield reply("用法：/aireplay prompt list|add <内容>|del <索引>|clear")
             return
 
         if " remind " in lower or lower.endswith(" remind"):
@@ -299,12 +387,13 @@ class AIReplay(Star):
             "/aireplay on|off\n"
             "/aireplay watch|unwatch\n"
             "/aireplay show\n"
+            "/aireplay debug\n"
             "/aireplay set after <分钟>\n"
             "/aireplay set daily1 <HH:MM>\n"
             "/aireplay set daily2 <HH:MM>\n"
             "/aireplay set quiet <HH:MM-HH:MM>\n"
             "/aireplay set history <N>\n"
-            "/aireplay set prompt <文本>\n"
+            "/aireplay prompt list|add <内容>|del <索引>|clear\n"
             "/aireplay remind add <YYYY-MM-DD HH:MM> <内容>\n"
             "/aireplay remind add <HH:MM> <内容> daily\n"
             "/aireplay remind list | /aireplay remind del <ID>\n"
@@ -317,6 +406,7 @@ class AIReplay(Star):
         arr.sort(key=lambda x: x.created_at)
         return "提醒列表：\n" + "\n".join(f"{r.id} | {r.at} | {r.content}" for r in arr)
 
+    # 调度器模块
     async def _scheduler_loop(self):
         try:
             while True:
@@ -351,6 +441,10 @@ class AIReplay(Star):
             if _in_quiet(now, quiet):
                 continue
 
+            # 检查是否需要自动退订
+            if await self._should_auto_unsubscribe(umo, st, now):
+                continue
+
             idle_min = int(self.cfg.get("after_last_msg_minutes") or 0)
             if idle_min > 0 and st.last_ts > 0:
                 last = datetime.fromtimestamp(st.last_ts, tz=now.tzinfo)
@@ -360,20 +454,44 @@ class AIReplay(Star):
                         ok = await self._proactive_reply(umo, hist_n, tz)
                         if ok:
                             st.last_fired_tag = tag
+                        else:
+                            st.consecutive_no_reply_count += 1
 
             if t1 and now.hour == t1[0] and now.minute == t1[1]:
                 if st.last_fired_tag != curr_min_tag_1:
                     ok = await self._proactive_reply(umo, hist_n, tz)
                     if ok:
                         st.last_fired_tag = curr_min_tag_1
+                    else:
+                        st.consecutive_no_reply_count += 1
             if t2 and now.hour == t2[0] and now.minute == t2[1]:
                 if st.last_fired_tag != curr_min_tag_2:
                     ok = await self._proactive_reply(umo, hist_n, tz)
                     if ok:
                         st.last_fired_tag = curr_min_tag_2
+                    else:
+                        st.consecutive_no_reply_count += 1
 
         await self._check_reminders(now, tz)
         self._save_states()
+
+    async def _should_auto_unsubscribe(self, umo: str, st: SessionState, now: datetime) -> bool:
+        """检查是否需要自动退订"""
+        max_days = int(self.cfg.get("max_no_reply_days") or 0)
+        if max_days <= 0:
+            return False
+        
+        if st.last_user_reply_ts > 0:
+            last_reply = datetime.fromtimestamp(st.last_user_reply_ts, tz=now.tzinfo)
+            days_since_reply = (now - last_reply).days
+            
+            if days_since_reply >= max_days:
+                st.subscribed = False
+                logger.info(f"[AIReplay] 自动退订 {umo}：用户{days_since_reply}天未回复")
+                return True
+        
+        return False
+
 
     async def _check_reminders(self, now: datetime, tz: Optional[str]):
         fired_ids = []
@@ -398,6 +516,7 @@ class AIReplay(Star):
         if fired_ids:
             self._save_reminders()
 
+    # 主动回复
     async def _proactive_reply(self, umo: str, hist_n: int, tz: Optional[str]) -> bool:
         try:
             fixed_provider = (self.cfg.get("_special") or {}).get("provider") or ""
@@ -424,25 +543,59 @@ class AIReplay(Star):
                     try:
                         persona_mgr = self.context.persona_manager
                         persona = persona_mgr.get_persona(persona_id)
-                        if persona and getattr(persona, "system_prompt", None):
+                        if persona and hasattr(persona, "system_prompt") and persona.system_prompt:
                             system_prompt = persona.system_prompt
-                    except Exception:
-                        pass
+                            logger.info(f"[AIReplay] 使用人格 {persona_id} 的system_prompt")
+                    except Exception as e:
+                        logger.warning(f"[AIReplay] 获取人格 {persona_id} 失败: {e}")
+                        # 尝试使用默认人格
+                        try:
+                            default_persona = persona_mgr.get_default_persona_v3(umo)
+                            if default_persona and "prompt" in default_persona:
+                                system_prompt = default_persona["prompt"]
+                                logger.info(f"[AIReplay] 使用默认人格的system_prompt")
+                        except Exception as e2:
+                            logger.warning(f"[AIReplay] 获取默认人格失败: {e2}")
 
+            # 规范化对话历史，兼容多种形态（JSON 字符串 / 列表 / 包含 messages 的字典）
             contexts: List[Dict] = []
+            raw_history = getattr(conversation, "history", None)
+
+            def _normalize_messages(msgs) -> List[Dict]:
+                if not msgs:
+                    return []
+                # 可能是 {"messages": [...]} 结构
+                if isinstance(msgs, dict) and "messages" in msgs:
+                    msgs = msgs["messages"]
+                normalized: List[Dict] = []
+                for m in msgs:
+                    if isinstance(m, dict):
+                        role = m.get("role") or m.get("speaker") or m.get("from")
+                        content = m.get("content") or m.get("text") or ""
+                        if role in ("user", "assistant", "system") and isinstance(content, str) and content:
+                            normalized.append({"role": role, "content": content})
+                return normalized
+
             try:
-                if conversation and conversation.history:
-                    arr = json.loads(conversation.history)
-                    contexts = arr[-hist_n:]
+                if raw_history:
+                    parsed = json.loads(raw_history) if isinstance(raw_history, str) else raw_history
+                    contexts = _normalize_messages(parsed)[-hist_n:]
             except Exception:
-                pass
+                contexts = []
+
+            # 回退：使用插件的轻量历史缓存
             if not contexts and hist_n > 0:
                 st = self._states.get(umo)
                 if st:
                     contexts = list(st.history)[-hist_n:]
 
-            templ = (self.cfg.get("custom_prompt") or "").strip()
-            if templ:
+            # 获取自定义提示词列表
+            custom_prompts = self.cfg.get("custom_prompts") or []
+            logger.info(f"[AIReplay] 获取到的提示词数量: {len(custom_prompts)}")
+            
+            if custom_prompts and len(custom_prompts) > 0:
+                # 随机选择一个提示词
+                templ = random.choice(custom_prompts).strip()
                 last_user = ""
                 last_ai = ""
                 for m in reversed(contexts):
@@ -455,6 +608,17 @@ class AIReplay(Star):
                 prompt = templ.format(now=_fmt_now(self.cfg.get("time_format") or "%Y-%m-%d %H:%M", tz), last_user=last_user, last_ai=last_ai, umo=umo)
             else:
                 prompt = "请自然地延续对话，与用户继续交流。"
+
+            # 调试模式：显示完整上下文
+            if self.cfg.get("debug_mode", False):
+                logger.info(f"[AIReplay] 调试模式 - 用户: {umo}")
+                logger.info(f"[AIReplay] 调试模式 - 系统提示词: {system_prompt or '(无)'}")
+                logger.info(f"[AIReplay] 调试模式 - 用户提示词: {prompt}")
+                logger.info(f"[AIReplay] 调试模式 - 上下文历史 ({len(contexts)}条):")
+                for i, ctx in enumerate(contexts):
+                    role = ctx.get("role", "unknown")
+                    content = ctx.get("content", "")
+                    logger.info(f"[AIReplay] 调试模式 - [{i+1}] {role}: {content[:100]}{'...' if len(content) > 100 else ''}")
 
             llm_resp = await provider.text_chat(
                 prompt=prompt,
@@ -470,11 +634,25 @@ class AIReplay(Star):
                 text = f"[{_fmt_now(self.cfg.get('time_format') or '%Y-%m-%d %H:%M', tz)}] " + text
 
             await self._send_text(umo, text)
+            logger.info(f"[AIReplay] 已发送主动回复给 {umo}: {text[:50]}...")
+
+            # 更新最后时间戳为AI发送消息的时间，并把AI回复写入轻量历史，方便下次回退
+            now_ts = _now_tz(tz).timestamp()
+            st = self._states.get(umo)
+            if st:
+                st.last_ts = now_ts
+                try:
+                    st.history.append({"role": "assistant", "content": text})
+                except Exception:
+                    pass
+                self._save_states()
+            
             return True
         except Exception as e:
             logger.error(f"[AIReplay] proactive error({umo}): {e}")
             return False
 
+    # 消息发送
     async def _send_text(self, umo: str, text: str):
         try:
             chain = MessageChain().message(text)
@@ -489,6 +667,61 @@ class AIReplay(Star):
                 await self._loop_task
             except Exception:
                 pass
-        self._save_states()
-        self._save_reminders()
+        
+        # 检查插件是否被卸载（通过检查插件主文件是否存在）
+        plugin_main_file = os.path.abspath(__file__)
+        is_uninstall = not os.path.exists(plugin_main_file)
+        
+        if is_uninstall:
+            # 插件被卸载 - 清除所有数据
+            logger.info("[AIReplay] 检测到插件卸载，开始清理数据...")
+            
+            # 清除用户配置
+            try:
+                # 重置所有配置项为默认值
+                self.cfg["enable"] = True
+                self.cfg["custom_prompts"] = []
+                self.cfg["max_no_reply_days"] = 0
+                self.cfg["persona_override"] = ""
+                self.cfg["quiet_hours"] = ""
+                self.cfg["timezone"] = ""
+                self.cfg["time_format"] = "%Y-%m-%d %H:%M"
+                self.cfg["history_depth"] = 8
+                self.cfg["after_last_msg_minutes"] = 0
+                self.cfg["append_time_field"] = False
+                self.cfg["daily"] = {}
+                self.cfg["subscribe_mode"] = "manual"
+                self.cfg["debug_mode"] = False
+                self.cfg["_special"] = {}
+                # 保存配置以确保清除生效
+                self.cfg.save_config()
+                logger.info("[AIReplay] 已清除用户配置")
+            except Exception as e:
+                logger.error(f"[AIReplay] 清除用户配置时出错: {e}")
+            
+            # 清理数据文件
+            try:
+                if os.path.exists(self._state_path):
+                    os.remove(self._state_path)
+                    logger.info(f"[AIReplay] 已删除状态文件: {self._state_path}")
+                if os.path.exists(self._remind_path):
+                    os.remove(self._remind_path)
+                    logger.info(f"[AIReplay] 已删除提醒文件: {self._remind_path}")
+                
+                # 如果数据目录为空，删除整个目录
+                if os.path.exists(self._data_dir) and not os.listdir(self._data_dir):
+                    os.rmdir(self._data_dir)
+                    logger.info(f"[AIReplay] 已删除数据目录: {self._data_dir}")
+            except Exception as e:
+                logger.error(f"[AIReplay] 清理数据文件时出错: {e}")
+        else:
+            # 插件被停用 - 只保存状态，不清理数据
+            logger.info("[AIReplay] 检测到插件停用，保存状态...")
+            try:
+                self._save_states()
+                self._save_reminders()
+                logger.info("[AIReplay] 状态已保存")
+            except Exception as e:
+                logger.error(f"[AIReplay] 保存状态时出错: {e}")
+        
         logger.info("[AIReplay] terminated.")
