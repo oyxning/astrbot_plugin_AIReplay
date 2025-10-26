@@ -8,7 +8,7 @@ import random
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, time
-from typing import Dict, List, Optional, Deque, Tuple
+from typing import Any, Dict, List, Optional, Deque, Tuple
 from collections import defaultdict, deque
 
 import astrbot.api.message_components as Comp
@@ -209,6 +209,157 @@ class AIReplay(Star):
         except Exception as e:
             logger.error(f"[AIReplay] 同步订阅用户配置失败: {e}")
 
+    # Build chat contexts from persisted conversation history with plugin fallback.
+    def _collect_contexts(self, conversation, st: Optional[SessionState], hist_n: int) -> List[Dict[str, str]]:
+        contexts: List[Dict[str, str]] = []
+        raw_sources: List[Any] = []
+        if conversation:
+            raw_sources.extend([
+                getattr(conversation, "history", None),
+                getattr(conversation, "messages", None),
+            ])
+        for raw in raw_sources:
+            if not raw:
+                continue
+            contexts = self._normalize_history(raw)
+            if contexts:
+                break
+        if not contexts and st and hist_n > 0:
+            contexts = list(st.history)
+        if hist_n > 0 and contexts:
+            contexts = contexts[-hist_n:]
+        return contexts
+
+    @staticmethod
+    def _normalize_history(raw: Any) -> List[Dict[str, str]]:
+        data = raw
+        contexts: List[Dict[str, str]] = []
+        if isinstance(raw, str):
+            try:
+                data = json.loads(raw)
+            except Exception:
+                data = None
+        if isinstance(data, dict):
+            if "messages" in data and isinstance(data["messages"], (list, tuple)):
+                data = data["messages"]
+            else:
+                normalized = AIReplay._normalize_history_item(data)
+                if isinstance(normalized, list):
+                    contexts.extend(normalized)
+                elif normalized:
+                    contexts.append(normalized)
+                return contexts
+        if isinstance(data, (list, tuple)):
+            for item in data:
+                normalized = AIReplay._normalize_history_item(item)
+                if isinstance(normalized, list):
+                    contexts.extend(normalized)
+                elif normalized:
+                    contexts.append(normalized)
+        return contexts
+
+    @staticmethod
+    def _normalize_history_item(item: Any) -> Optional[Dict[str, str]]:
+        def normalize_role(role_value: Any) -> Optional[str]:
+            if isinstance(role_value, str):
+                v = role_value.lower()
+                mapping = {
+                    "assistant": "assistant",
+                    "bot": "assistant",
+                    "ai": "assistant",
+                    "model": "assistant",
+                    "system": "system",
+                    "user": "user",
+                    "human": "user",
+                }
+                return mapping.get(v, v)
+            return None
+
+        def extract_content(value: Any) -> str:
+            if isinstance(value, str):
+                return value.strip()
+            if isinstance(value, (list, tuple)):
+                parts: List[str] = []
+                for seg in value:
+                    if isinstance(seg, str):
+                        parts.append(seg)
+                    elif isinstance(seg, dict):
+                        for key in ("text", "content", "value"):
+                            val = seg.get(key)
+                            if isinstance(val, str) and val.strip():
+                                parts.append(val.strip())
+                                break
+                return "\n".join(p for p in parts if p)
+            if isinstance(value, dict):
+                for key in ("text", "content", "value"):
+                    val = value.get(key)
+                    if isinstance(val, str) and val.strip():
+                        return val.strip()
+                if "messages" in value:
+                    nested = AIReplay._normalize_history(value["messages"])
+                    return "\n".join(m["content"] for m in nested if m.get("content"))
+            if value is None:
+                return ""
+            return str(value).strip()
+
+        if isinstance(item, (list, tuple)):
+            nested: List[Dict[str, str]] = []
+            for sub in item:
+                normalized = AIReplay._normalize_history_item(sub)
+                if isinstance(normalized, list):
+                    nested.extend(normalized)
+                elif normalized:
+                    nested.append(normalized)
+            return nested
+
+        role: Optional[str] = None
+        content: str = ""
+
+        if isinstance(item, dict):
+            if "messages" in item:
+                nested = AIReplay._normalize_history(item["messages"])
+                return nested
+            role = normalize_role(item.get("role") or item.get("speaker") or item.get("type") or item.get("sender") or item.get("from"))
+            content = extract_content(item.get("content"))
+            if not content:
+                for key in ("text", "message", "value"):
+                    candidate = item.get(key)
+                    content = extract_content(candidate)
+                    if content:
+                        break
+        elif hasattr(item, "role") and hasattr(item, "content"):
+            role = normalize_role(getattr(item, "role"))
+            content = extract_content(getattr(item, "content"))
+        elif isinstance(item, str):
+            role = "user"
+            content = item.strip()
+
+        if not role:
+            role = "user"
+        content = content.strip()
+        if not content:
+            return None
+        if role not in ("user", "assistant", "system"):
+            role = "user"
+        return {"role": role, "content": content}
+
+    @staticmethod
+    def _extract_prompt(source: Any) -> str:
+        if not source:
+            return ""
+        if isinstance(source, str):
+            return source.strip()
+        if isinstance(source, dict):
+            for key in ("system_prompt", "prompt", "content", "text"):
+                val = source.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+        for key in ("system_prompt", "prompt", "content", "text"):
+            val = getattr(source, key, None)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        return ""
+
     # 消息处理
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def _on_any_message(self, event: AstrMessageEvent):
@@ -230,10 +381,13 @@ class AIReplay(Star):
         st = self._states[umo]
         now_ts = _now_tz(self.cfg.get("timezone") or None).timestamp()
         st.last_ts = now_ts
+<<<<<<< HEAD
         st.last_user_reply_ts = now_ts  # 记录用户最后回复时间
         st.consecutive_no_reply_count = 0  # 重置无回复计数
 
         # 检查订阅状态：支持自动订阅模式 + WebUI配置列表
+=======
+>>>>>>> d8c097f251064f86623b27d37707d79bab9bf42e
         if (self.cfg.get("subscribe_mode") or "manual") == "auto":
             st.subscribed = True
         else:
@@ -245,10 +399,15 @@ class AIReplay(Star):
                 logger.info(f"[AIReplay] 用户 {user_id} 在配置订阅列表中，已自动订阅")
 
         try:
-            role = "user"
-            content = event.message_str or ""
+            role = "assistant" if getattr(event, "is_self", False) or getattr(event, "is_bot", False) else "user"
+            if getattr(event, "is_system", False):
+                role = "system"
+            content = (event.message_str or "").strip()
             if content:
                 st.history.append({"role": role, "content": content})
+                if role == "user":
+                    st.last_user_reply_ts = now_ts
+                    st.consecutive_no_reply_count = 0
         except Exception:
             pass
 
@@ -723,6 +882,7 @@ class AIReplay(Star):
         self._save_states()
 
     async def _should_auto_unsubscribe(self, umo: str, st: SessionState, now: datetime) -> bool:
+<<<<<<< HEAD
         """
         检查是否需要自动退订（根据用户无回复天数）
         
@@ -741,6 +901,9 @@ class AIReplay(Star):
         - 则自动将该用户的 subscribed 状态设为 False
         - 这样可以避免长期无人回复的会话持续消耗 LLM 额度
         """
+=======
+        """检查是否需要自动退订。"""
+>>>>>>> d8c097f251064f86623b27d37707d79bab9bf42e
         max_days = int(self.cfg.get("max_no_reply_days") or 0)
         if max_days <= 0:
             return False
@@ -837,6 +1000,7 @@ class AIReplay(Star):
             curr_cid = await conv_mgr.get_curr_conversation_id(umo)
             conversation = await conv_mgr.get_conversation(umo, curr_cid)
 
+<<<<<<< HEAD
             # 获取 system_prompt（多重降级策略）
             system_prompt = ""
             persona_obj = None
@@ -962,9 +1126,78 @@ class AIReplay(Star):
                     if last_user and last_ai:
                         break
                 prompt = templ.format(now=_fmt_now(self.cfg.get("time_format") or "%Y-%m-%d %H:%M", tz), last_user=last_user, last_ai=last_ai, umo=umo)
-            else:
-                prompt = "请自然地延续对话，与用户继续交流。"
+=======
+            persona_mgr = getattr(self.context, "persona_manager", None)
+            persona_override = (self.cfg.get("persona_override") or "").strip()
+            system_prompt = persona_override
+            persona_obj = None
 
+            if not system_prompt:
+                fixed_persona = (self.cfg.get("_special") or {}).get("persona") or ""
+                persona_id = fixed_persona or (getattr(conversation, "persona_id", "") or "")
+                if persona_id and persona_mgr:
+                    try:
+                        persona_obj = persona_mgr.get_persona(persona_id)
+                    except Exception as err:
+                        logger.warning(f"[AIReplay] persona {persona_id} lookup failed: {err}")
+                        persona_obj = None
+
+                if persona_obj is None and conversation is not None:
+                    persona_obj = getattr(conversation, "persona", None)
+
+                if persona_obj is None and persona_mgr:
+                    for getter_name in ("get_default_persona_v3", "get_default_persona", "get_default"):
+                        getter = getattr(persona_mgr, getter_name, None)
+                        if not callable(getter):
+                            continue
+                        try:
+                            try:
+                                persona_obj = getter(umo)
+                            except TypeError:
+                                persona_obj = getter()
+                        except Exception as err:
+                            logger.warning(f"[AIReplay] default persona via {getter_name} failed: {err}")
+                            persona_obj = None
+                        if persona_obj:
+                            break
+
+                system_prompt = self._extract_prompt(persona_obj) or self._extract_prompt(conversation)
+
+            st = self._states.get(umo)
+            contexts = self._collect_contexts(conversation, st, hist_n)
+
+            custom_prompts_cfg = self.cfg.get("custom_prompts") or []
+            custom_prompts = []
+            for item in custom_prompts_cfg:
+                if isinstance(item, (str, bytes)):
+                    value = str(item).strip()
+                    if value:
+                        custom_prompts.append(value)
+
+            last_user = ""
+            last_ai = ""
+            for m in reversed(contexts):
+                role = m.get("role")
+                if not last_user and role == "user":
+                    last_user = m.get("content", "")
+                if not last_ai and role == "assistant":
+                    last_ai = m.get("content", "")
+                if last_user and last_ai:
+                    break
+
+            now_str = _fmt_now(self.cfg.get("time_format") or "%Y-%m-%d %H:%M", tz)
+            if custom_prompts:
+                templ = random.choice(custom_prompts)
+                try:
+                    prompt = templ.format(now=now_str, last_user=last_user, last_ai=last_ai, umo=umo)
+                except Exception as fmt_err:
+                    logger.warning(f"[AIReplay] custom prompt format error: {fmt_err}")
+                    prompt = templ
+>>>>>>> d8c097f251064f86623b27d37707d79bab9bf42e
+            else:
+                prompt = "\u8bf7\u81ea\u7136\u5730\u5ef6\u7eed\u5bf9\u8bdd\uff0c\u4e0e\u7528\u6237\u7ee7\u7eed\u4ea4\u6d41\u3002"
+
+<<<<<<< HEAD
             # 调试模式：显示完整上下文（已可删除）
             if self.cfg.get("debug_mode", False):
                 logger.info(f"[AIReplay] ========== 调试模式开始 ==========")
@@ -984,6 +1217,16 @@ class AIReplay(Star):
                 else:
                     logger.warning(f"[AIReplay] ⚠️ 警告：上下文为空！这会导致AI无法记住之前的对话")
                 logger.info(f"[AIReplay] ========== 调试模式结束 ==========")
+=======
+            if self.cfg.get("debug_mode"):
+                logger.info(f"[AIReplay][DEBUG] umo={umo} system_prompt={system_prompt!r}")
+                logger.info(f"[AIReplay][DEBUG] prompt={prompt}")
+                for idx, ctx in enumerate(contexts, 1):
+                    role = ctx.get("role", "unknown")
+                    content = ctx.get("content", "")
+                    preview = content[:100] + ("..." if len(content) > 100 else "")
+                    logger.info(f"[AIReplay][DEBUG] ctx[{idx}] {role}: {preview}")
+>>>>>>> d8c097f251064f86623b27d37707d79bab9bf42e
 
             # 调用 LLM（注意：参数名是 contexts 复数！！！）
             llm_resp = await provider.text_chat(
@@ -991,33 +1234,28 @@ class AIReplay(Star):
                 contexts=contexts,  # ← 修复：使用 contexts（复数）。
                 system_prompt=system_prompt or ""
             )
-            text = llm_resp.completion_text if hasattr(llm_resp, "completion_text") else ""
-
-            if not text.strip():
+            text = getattr(llm_resp, "completion_text", None)
+            if text is None:
+                text = getattr(llm_resp, "text", "")
+            if not text or not text.strip():
                 return False
 
             if bool(self.cfg.get("append_time_field")):
-                text = f"[{_fmt_now(self.cfg.get('time_format') or '%Y-%m-%d %H:%M', tz)}] " + text
+                text = f"[{now_str}] {text}"
 
             await self._send_text(umo, text)
-            logger.info(f"[AIReplay] 已发送主动回复给 {umo}: {text[:50]}...")
+            logger.info(f"[AIReplay] proactive reply sent to {umo}: {text[:50]}{'...' if len(text) > 50 else ''}")
 
-            # 更新最后时间戳为AI发送消息的时间，并把AI回复写入轻量历史，方便下次回退
             now_ts = _now_tz(tz).timestamp()
-            st = self._states.get(umo)
             if st:
                 st.last_ts = now_ts
-                try:
-                    st.history.append({"role": "assistant", "content": text})
-                except Exception:
-                    pass
+                st.consecutive_no_reply_count = 0
                 self._save_states()
-            
+
             return True
         except Exception as e:
             logger.error(f"[AIReplay] proactive error({umo}): {e}")
             return False
-
     # 消息发送
     async def _send_text(self, umo: str, text: str):
         """
@@ -1039,6 +1277,9 @@ class AIReplay(Star):
         try:
             chain = MessageChain().message(text)
             await self.context.send_message(umo, chain)
+            st = self._states.get(umo)
+            if st:
+                st.history.append({"role": "assistant", "content": text})
         except Exception as e:
             logger.error(f"[AIReplay] send_message error({umo}): {e}")
 
