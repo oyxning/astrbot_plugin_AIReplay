@@ -38,7 +38,7 @@
   "history_depth": {
     "description": "拼接最近聊天记录条数（从当前对话历史中提取）",
     "type": "int",
-    "default": 8
+    "default": 50
   },
   "persona_override": {
     "description": "自定义人格 System Prompt（留空使用当前对话人格）",
@@ -75,7 +75,7 @@
   "max_no_reply_days": {
     "description": "用户无回复多少天后自动退订（0表示不自动退订）",
     "type": "int",
-    "default": 7
+    "default": 3
   },
   "debug_mode": {
     "description": "调试模式：显示主动回复的完整上下文内容",
@@ -83,7 +83,7 @@
     "default": false
   },
     "subscribed_users": {
-      "description": "订阅用户列表（用户ID，支持直接添加/删除）【1.1.0 新增】",
+      "description": "订阅用户列表（用户ID，支持直接添加/删除）",
       "type": "list",
       "default": [],
       "items": {
