@@ -146,8 +146,10 @@ class AIReplay(Star):
                     user_id = umo.split(":")[-1] if ":" in umo else umo
                     subscribed_ids.append(user_id)
             
+            logger.debug(f"[AIReplay] _save_states: 同步 {len(subscribed_ids)} 个订阅用户到配置: {subscribed_ids}")
             self.cfg["subscribed_users"] = subscribed_ids
             self.cfg.save_config()
+            logger.debug(f"[AIReplay] _save_states: 配置已保存")
             
         except Exception as e:
             logger.error(f"[AIReplay] save states error: {e}")
@@ -204,7 +206,11 @@ class AIReplay(Star):
             # 注意：这些用户的完整 umo 要等到他们第一次发消息时才能确定
             # 所以这里只是做个标记，实际订阅会在 _on_any_message 中生效
             
-            logger.info(f"[AIReplay] 已从配置同步 {len(config_subscribed_ids)} 个订阅用户")
+            logger.info(f"[AIReplay] 已从配置同步 {len(config_subscribed_ids)} 个订阅用户ID: {config_subscribed_ids}")
+            
+            # 显示当前所有已订阅的会话
+            subscribed_sessions = [umo for umo, st in self._states.items() if st.subscribed]
+            logger.info(f"[AIReplay] 当前已订阅的会话数: {len(subscribed_sessions)}")
             
         except Exception as e:
             logger.error(f"[AIReplay] 同步订阅用户配置失败: {e}")
@@ -233,16 +239,9 @@ class AIReplay(Star):
         st.last_user_reply_ts = now_ts  # 记录用户最后回复时间
         st.consecutive_no_reply_count = 0  # 重置无回复计数
 
-        # 检查订阅状态：支持自动订阅模式 + WebUI配置列表
+        # 检查订阅状态：支持自动订阅模式
         if (self.cfg.get("subscribe_mode") or "manual") == "auto":
             st.subscribed = True
-        else:
-            # manual 模式下，检查用户ID是否在配置的订阅列表中
-            user_id = umo.split(":")[-1] if ":" in umo else umo
-            config_subscribed_ids = self.cfg.get("subscribed_users") or []
-            if user_id in config_subscribed_ids and not st.subscribed:
-                st.subscribed = True
-                logger.info(f"[AIReplay] 用户 {user_id} 在配置订阅列表中，已自动订阅")
 
         try:
             role = "user"
@@ -321,6 +320,7 @@ class AIReplay(Star):
             if umo not in self._states:
                 self._states[umo] = SessionState()
             self._states[umo].subscribed = True
+            logger.info(f"[AIReplay] 用户执行 watch 命令: {umo}")
             self._save_states()
             yield reply(f"📌 已订阅当前会话")
             return
@@ -666,7 +666,10 @@ class AIReplay(Star):
         注意：每个触发条件都会记录一个唯一的 tag，防止同一时刻重复触发
         """
         if not self.cfg.get("enable", True):
+            logger.debug("[AIReplay] Tick: 插件被停用，跳过")
             return
+        
+        logger.debug("[AIReplay] Tick: 开始检查...")
 
         tz = self.cfg.get("timezone") or None
         now = _now_tz(tz)
@@ -682,42 +685,68 @@ class AIReplay(Star):
         curr_min_tag_1 = f"daily1@{now.strftime('%Y-%m-%d')} {t1[0]:02d}:{t1[1]:02d}" if t1 else ""
         curr_min_tag_2 = f"daily2@{now.strftime('%Y-%m-%d')} {t2[0]:02d}:{t2[1]:02d}" if t2 else ""
 
+        subscribed_count = sum(1 for st in self._states.values() if st.subscribed)
+        logger.debug(f"[AIReplay] Tick: 当前时间={now.strftime('%Y-%m-%d %H:%M')}, 订阅用户数={subscribed_count}, 免打扰={quiet}")
+        
         for umo, st in list(self._states.items()):
             if not st.subscribed:
                 continue
+            
             if _in_quiet(now, quiet):
+                logger.debug(f"[AIReplay] Tick: {umo} 在免打扰时间，跳过")
                 continue
 
             # 检查是否需要自动退订
             if await self._should_auto_unsubscribe(umo, st, now):
+                logger.debug(f"[AIReplay] Tick: {umo} 被自动退订")
                 continue
+            
+            logger.debug(f"[AIReplay] Tick: 检查 {umo}, last_ts={st.last_ts}, last_fired_tag={st.last_fired_tag}")
 
             idle_min = int(self.cfg.get("after_last_msg_minutes") or 0)
             if idle_min > 0 and st.last_ts > 0:
                 last = datetime.fromtimestamp(st.last_ts, tz=now.tzinfo)
+                diff_min = (now - last).total_seconds() / 60
+                logger.debug(f"[AIReplay] Tick: {umo} 间隔检查 - 配置={idle_min}分钟, 实际={diff_min:.1f}分钟")
                 if now - last >= timedelta(minutes=idle_min):
                     tag = f"idle@{now.strftime('%Y-%m-%d %H:%M')}"
                     if st.last_fired_tag != tag:
+                        logger.info(f"[AIReplay] Tick: 触发间隔回复 {umo}")
                         ok = await self._proactive_reply(umo, hist_n, tz)
                         if ok:
                             st.last_fired_tag = tag
                         else:
                             st.consecutive_no_reply_count += 1
+                    else:
+                        logger.debug(f"[AIReplay] Tick: {umo} 已触发过 {tag}")
+            elif idle_min > 0:
+                logger.debug(f"[AIReplay] Tick: {umo} last_ts=0，跳过间隔检查")
 
-            if t1 and now.hour == t1[0] and now.minute == t1[1]:
-                if st.last_fired_tag != curr_min_tag_1:
-                    ok = await self._proactive_reply(umo, hist_n, tz)
-                    if ok:
-                        st.last_fired_tag = curr_min_tag_1
+            if t1:
+                logger.debug(f"[AIReplay] Tick: {umo} 每日定时1检查 - 配置={t1[0]:02d}:{t1[1]:02d}, 当前={now.hour:02d}:{now.minute:02d}")
+                if now.hour == t1[0] and now.minute == t1[1]:
+                    if st.last_fired_tag != curr_min_tag_1:
+                        logger.info(f"[AIReplay] Tick: 触发每日定时1回复 {umo}")
+                        ok = await self._proactive_reply(umo, hist_n, tz)
+                        if ok:
+                            st.last_fired_tag = curr_min_tag_1
+                        else:
+                            st.consecutive_no_reply_count += 1
                     else:
-                        st.consecutive_no_reply_count += 1
-            if t2 and now.hour == t2[0] and now.minute == t2[1]:
-                if st.last_fired_tag != curr_min_tag_2:
-                    ok = await self._proactive_reply(umo, hist_n, tz)
-                    if ok:
-                        st.last_fired_tag = curr_min_tag_2
+                        logger.debug(f"[AIReplay] Tick: {umo} 已触发过 {curr_min_tag_1}")
+                        
+            if t2:
+                logger.debug(f"[AIReplay] Tick: {umo} 每日定时2检查 - 配置={t2[0]:02d}:{t2[1]:02d}, 当前={now.hour:02d}:{now.minute:02d}")
+                if now.hour == t2[0] and now.minute == t2[1]:
+                    if st.last_fired_tag != curr_min_tag_2:
+                        logger.info(f"[AIReplay] Tick: 触发每日定时2回复 {umo}")
+                        ok = await self._proactive_reply(umo, hist_n, tz)
+                        if ok:
+                            st.last_fired_tag = curr_min_tag_2
+                        else:
+                            st.consecutive_no_reply_count += 1
                     else:
-                        st.consecutive_no_reply_count += 1
+                        logger.debug(f"[AIReplay] Tick: {umo} 已触发过 {curr_min_tag_2}")
 
         await self._check_reminders(now, tz)
         self._save_states()
