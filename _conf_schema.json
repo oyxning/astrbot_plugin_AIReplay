@@ -82,6 +82,14 @@
     "type": "bool",
     "default": false
   },
+    "subscribed_users": {
+      "description": "订阅用户列表（用户ID，支持直接添加/删除）【1.1.0 新增】",
+      "type": "list",
+      "default": [],
+      "items": {
+        "type": "string"
+      }
+    },
   "_special": {
     "description": "可视化选择默认聊天模型/人格（可选）",
     "type": "object",
