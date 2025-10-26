@@ -7,7 +7,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, time
-from typing import Dict, List, Optional, Deque, Tuple
+from typing import Any, Dict, List, Optional, Deque, Tuple
 from collections import defaultdict, deque
 
 import astrbot.api.message_components as Comp
@@ -133,6 +133,135 @@ class AIReplay(Star):
         except Exception as e:
             logger.error(f"[AIReplay] save reminders error: {e}")
 
+    # Build chat contexts from persisted conversation history with plugin fallback.
+    def _collect_contexts(self, conversation, st: Optional[SessionState], hist_n: int) -> List[Dict[str, str]]:
+        contexts: List[Dict[str, str]] = []
+        raw_sources = []
+        if conversation:
+            raw_sources.extend([
+                getattr(conversation, "history", None),
+                getattr(conversation, "messages", None),
+            ])
+        for raw in raw_sources:
+            if not raw:
+                continue
+            contexts = self._normalize_history(raw)
+            if contexts:
+                break
+        if not contexts and st and hist_n > 0:
+            contexts = list(st.history)
+        if hist_n > 0 and contexts:
+            contexts = contexts[-hist_n:]
+        return contexts
+
+    @staticmethod
+    def _normalize_history(raw: Any) -> List[Dict[str, str]]:
+        data = raw
+        contexts: List[Dict[str, str]] = []
+        if isinstance(raw, str):
+            try:
+                data = json.loads(raw)
+            except Exception:
+                data = None
+        if isinstance(data, (list, tuple)):
+            for item in data:
+                normalized = AIReplay._normalize_history_item(item)
+                if normalized:
+                    contexts.append(normalized)
+        elif isinstance(data, dict):
+            normalized = AIReplay._normalize_history_item(data)
+            if normalized:
+                contexts.append(normalized)
+        return contexts
+
+    @staticmethod
+    def _normalize_history_item(item: Any) -> Optional[Dict[str, str]]:
+        def normalize_role(role_value: Any) -> Optional[str]:
+            if isinstance(role_value, str):
+                v = role_value.lower()
+                mapping = {
+                    "assistant": "assistant",
+                    "bot": "assistant",
+                    "ai": "assistant",
+                    "model": "assistant",
+                    "system": "system",
+                    "user": "user",
+                    "human": "user"
+                }
+                if v in mapping:
+                    return mapping[v]
+                return v
+            return None
+
+        def extract_content(value: Any) -> str:
+            if isinstance(value, str):
+                return value.strip()
+            if isinstance(value, (list, tuple)):
+                parts: List[str] = []
+                for seg in value:
+                    if isinstance(seg, str):
+                        parts.append(seg)
+                    elif isinstance(seg, dict):
+                        for key in ("text", "content", "value"):
+                            val = seg.get(key)
+                            if isinstance(val, str) and val.strip():
+                                parts.append(val.strip())
+                                break
+                return "\n".join(p for p in parts if p)
+            if isinstance(value, dict):
+                for key in ("text", "content", "value"):
+                    val = value.get(key)
+                    if isinstance(val, str) and val.strip():
+                        return val.strip()
+            if value is None:
+                return ""
+            return str(value).strip()
+
+        role: Optional[str] = None
+        content: str = ""
+
+        if isinstance(item, dict):
+            role = normalize_role(item.get("role") or item.get("speaker") or item.get("type") or item.get("sender"))
+            content = extract_content(item.get("content"))
+            if not content:
+                for key in ("text", "message", "value"):
+                    candidate = item.get(key)
+                    content = extract_content(candidate)
+                    if content:
+                        break
+        elif hasattr(item, "role") and hasattr(item, "content"):
+            role = normalize_role(getattr(item, "role"))
+            content = extract_content(getattr(item, "content"))
+        elif isinstance(item, str):
+            role = "user"
+            content = item.strip()
+
+        if not role:
+            role = "user"
+        content = content.strip()
+        if not content:
+            return None
+        if role not in ("user", "assistant", "system"):
+            role = "user"
+        return {"role": role, "content": content}
+
+    @staticmethod
+    def _extract_prompt(source: Any) -> str:
+        if not source:
+            return ""
+        if isinstance(source, str):
+            return source.strip()
+        if isinstance(source, dict):
+            for key in ("system_prompt", "prompt", "content", "text"):
+                val = source.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+        for key in ("system_prompt", "prompt", "content", "text"):
+            val = getattr(source, key, None)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        return ""
+
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def _on_any_message(self, event: AstrMessageEvent):
         umo = event.unified_msg_origin
@@ -143,7 +272,9 @@ class AIReplay(Star):
             st.subscribed = True
 
         try:
-            role = "user"
+            role = "assistant" if getattr(event, "is_self", False) or getattr(event, "is_bot", False) else "user"
+            if getattr(event, "is_system", False):
+                role = "system"
             content = event.message_str or ""
             if content:
                 st.history.append({"role": role, "content": content})
@@ -414,32 +545,37 @@ class AIReplay(Star):
             curr_cid = await conv_mgr.get_curr_conversation_id(umo)
             conversation = await conv_mgr.get_conversation(umo, curr_cid)
 
+            persona_mgr = getattr(self.context, "persona_manager", None)
+            persona_override = (self.cfg.get("persona_override") or "").strip()
+
             system_prompt = ""
-            if (self.cfg.get("persona_override") or "").strip():
-                system_prompt = self.cfg.get("persona_override")
+            if persona_override:
+                system_prompt = persona_override
             else:
+                persona_obj = None
                 fixed_persona = (self.cfg.get("_special") or {}).get("persona") or ""
                 persona_id = fixed_persona or (getattr(conversation, "persona_id", "") or "")
-                if persona_id:
+                if persona_id and persona_mgr:
                     try:
-                        persona_mgr = self.context.persona_manager
-                        persona = persona_mgr.get_persona(persona_id)
-                        if persona and getattr(persona, "system_prompt", None):
-                            system_prompt = persona.system_prompt
+                        persona_obj = persona_mgr.get_persona(persona_id)
                     except Exception:
-                        pass
+                        persona_obj = None
+                if not persona_obj and conversation:
+                    persona_obj = getattr(conversation, "persona", None)
+                if not persona_obj and persona_mgr:
+                    for getter_name in ("get_default_persona", "get_default"):
+                        getter = getattr(persona_mgr, getter_name, None)
+                        if callable(getter):
+                            try:
+                                persona_obj = getter()
+                            except Exception:
+                                persona_obj = None
+                            if persona_obj:
+                                break
+                system_prompt = self._extract_prompt(persona_obj) or self._extract_prompt(conversation)
 
-            contexts: List[Dict] = []
-            try:
-                if conversation and conversation.history:
-                    arr = json.loads(conversation.history)
-                    contexts = arr[-hist_n:]
-            except Exception:
-                pass
-            if not contexts and hist_n > 0:
-                st = self._states.get(umo)
-                if st:
-                    contexts = list(st.history)[-hist_n:]
+            st = self._states.get(umo)
+            contexts = self._collect_contexts(conversation, st, hist_n)
 
             templ = (self.cfg.get("custom_prompt") or "").strip()
             if templ:
@@ -479,6 +615,10 @@ class AIReplay(Star):
         try:
             chain = MessageChain().message(text)
             await self.context.send_message(umo, chain)
+            st = self._states.get(umo)
+            if st:
+                st.history.append({"role": "assistant", "content": text})
+                self._save_states()
         except Exception as e:
             logger.error(f"[AIReplay] send_message error({umo}): {e}")
 
